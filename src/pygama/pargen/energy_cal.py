@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import logging
 import string
+from collections.abc import Callable, Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,6 +29,23 @@ from pygama.math.least_squares import fit_simple_scaling
 from pygama.pargen.utils import convert_to_minuit, return_nans
 
 log = logging.getLogger(__name__)
+
+BayesianPeakFitter = Callable[..., tuple[Mapping[str, object], object]]
+BayesianCalibrationFitter = Callable[..., tuple[Mapping[str, object], object]]
+# A Bayesian backend is a drop-in replacement: callers keep receiving exactly
+# this six-array pygama result topology.
+_CALIBRATION_RESULT_KEYS = {
+    "pk_cal_pars",
+    "pk_cal_errs",
+    "pk_cal_cov",
+    "calibration_parameters",
+    "calibration_uncertainties",
+    "calibration_covariance",
+}
+
+
+class BayesianFitBackendError(RuntimeError):
+    """Raised when an injected Bayesian fitter violates its contract."""
 
 
 class HPGeCalibration:
@@ -96,6 +114,221 @@ class HPGeCalibration:
 
         self.uncal_is_int = uncal_is_int
         self.debug_mode = debug_mode
+        self._bayesian_peak_fitter: BayesianPeakFitter | None = None
+        self._bayesian_calibration_fitter: BayesianCalibrationFitter | None = None
+        # Keep raw posteriors separate from pygama's established result format.
+        # Each list entry corresponds to one hpge_fit_energy_peaks call.
+        self.bayesian_peak_posteriors: list[dict[float, dict[str, np.ndarray]]] = []
+        self.bayesian_peak_fits: list[dict[float, object]] = []
+        self.bayesian_calibration_posteriors: list[object] = []
+
+    def set_bayesian_fitters(
+        self,
+        peak_fitter: BayesianPeakFitter | None,
+        calibration_fitter: BayesianCalibrationFitter | None,
+    ) -> None:
+        """Configure optional Bayesian peak and calibration fitters.
+
+        Passing ``None`` for both fitters restores the existing frequentist
+        implementation. Bayesian peak and curve fitting are enabled together
+        because the curve consumes the fitted peak-position posteriors.
+        """
+
+        if (peak_fitter is None) != (calibration_fitter is None):
+            msg = "peak_fitter and calibration_fitter must be configured together"
+            raise ValueError(msg)
+        self._bayesian_peak_fitter = peak_fitter
+        self._bayesian_calibration_fitter = calibration_fitter
+
+    def _fit_bayesian_peak(
+        self,
+        energies: np.ndarray,
+        function: object,
+        fit_range: tuple[float, float],
+        mode_guess: float,
+        peak_param: str,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        float,
+        float,
+        dict[str, np.ndarray],
+        object,
+    ]:
+        """Run one Bayesian peak model and summarize its posterior draws."""
+
+        if self._bayesian_peak_fitter is None:
+            raise RuntimeError("no Bayesian peak fitter is configured")
+        model_name = getattr(function, "name", None)
+        required_args = getattr(function, "required_args", None)
+        if not isinstance(model_name, str) or not callable(required_args):
+            msg = "the selected peak model does not expose pygama model metadata"
+            raise BayesianFitBackendError(msg)
+
+        backend_output = self._bayesian_peak_fitter(
+            energies=energies,
+            model_name=model_name,
+            fit_range=fit_range,
+            mode_guess=mode_guess,
+        )
+        if not isinstance(backend_output, tuple) or len(backend_output) != 2:
+            msg = "the Bayesian peak fitter must return draws and a fit artifact"
+            raise BayesianFitBackendError(msg)
+        posterior_output, fit_artifact = backend_output
+        if not isinstance(posterior_output, Mapping):
+            msg = "the Bayesian peak fitter must return named posterior draws"
+            raise BayesianFitBackendError(msg)
+
+        parameter_names = tuple(required_args())
+        required_names = {*parameter_names, "mode"}
+        if not required_names <= set(posterior_output):
+            missing = sorted(required_names - set(posterior_output))
+            msg = f"the Bayesian peak posterior is missing draws for {missing}"
+            raise BayesianFitBackendError(msg)
+
+        posterior: dict[str, np.ndarray] = {}
+        draw_count: int | None = None
+        for name, values in posterior_output.items():
+            if not isinstance(name, str):
+                msg = "Bayesian peak posterior names must be strings"
+                raise BayesianFitBackendError(msg)
+            draws = np.asarray(values, dtype=float)
+            if draws.ndim != 1 or len(draws) < 2:
+                msg = f"posterior draws for {name} must be a one-dimensional array"
+                raise BayesianFitBackendError(msg)
+            if not np.all(np.isfinite(draws)):
+                msg = f"posterior draws for {name} contain non-finite values"
+                raise BayesianFitBackendError(msg)
+            if draw_count is not None and len(draws) != draw_count:
+                msg = "all Bayesian peak posterior arrays must have equal length"
+                raise BayesianFitBackendError(msg)
+            draw_count = len(draws)
+            posterior[name] = draws
+
+        parameter_draws = np.column_stack([posterior[name] for name in parameter_names])
+        parameters = np.mean(parameter_draws, axis=0)
+        covariance = np.asarray(np.cov(parameter_draws, rowvar=False, ddof=1))
+        uncertainties = np.sqrt(np.clip(np.diag(covariance), 0.0, None))
+
+        if peak_param == "mu":
+            position_draws = posterior["mu"]
+        elif peak_param == "mode":
+            position_draws = posterior["mode"]
+        else:
+            raise ValueError(f"peak parameter {peak_param!r} is not recognized")
+        position = float(np.mean(position_draws))
+        position_uncertainty = float(np.std(position_draws, ddof=1))
+        return (
+            parameters,
+            uncertainties,
+            covariance,
+            position,
+            position_uncertainty,
+            posterior,
+            fit_artifact,
+        )
+
+    def _fit_calibration_curve(
+        self,
+        peak_positions: np.ndarray,
+        peak_position_variances: np.ndarray,
+        literature_energies_kev: np.ndarray,
+        peak_mode_draws: list[np.ndarray] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Run the configured curve fitter and normalize its flat result."""
+
+        # Preserve pygama's frequentist behavior until an application injects
+        # the Bayesian backend explicitly.
+        if self._bayesian_calibration_fitter is None:
+            pars, errs, cov = hpge_fit_energy_scale(
+                peak_positions,
+                peak_position_variances,
+                literature_energies_kev,
+                deg=self.deg,
+                fixed=self.fixed,
+            )
+            result = {
+                "pk_cal_pars": pars,
+                "pk_cal_errs": errs,
+                "pk_cal_cov": cov,
+            }
+            pars, errs, cov = hpge_fit_energy_cal_func(
+                peak_positions,
+                peak_position_variances,
+                literature_energies_kev,
+                pars,
+                deg=self.deg,
+                fixed=self.fixed,
+            )
+            result.update(
+                {
+                    "calibration_parameters": pars,
+                    "calibration_uncertainties": errs,
+                    "calibration_covariance": cov,
+                }
+            )
+            return result
+
+        try:
+            if peak_mode_draws is None:
+                msg = "Bayesian calibration requires peak-mode posterior draws"
+                raise BayesianFitBackendError(msg)
+            backend_output = self._bayesian_calibration_fitter(
+                peak_mode_draws=peak_mode_draws,
+                literature_energies_kev=literature_energies_kev,
+                degree=self.deg,
+                fixed_coefficients=self.fixed,
+            )
+        except BayesianFitBackendError:
+            raise
+        except Exception as exc:
+            msg = "the injected Bayesian calibration fitter failed"
+            raise BayesianFitBackendError(msg) from exc
+
+        if not isinstance(backend_output, tuple) or len(backend_output) != 2:
+            msg = "the injected backend must return results and a separate artifact"
+            raise BayesianFitBackendError(msg)
+        result, artifact = backend_output
+        # Reject topology drift at the integration boundary rather than letting
+        # an incompatible result fail later in an unrelated consumer.
+        if not isinstance(result, Mapping) or set(result) != _CALIBRATION_RESULT_KEYS:
+            msg = "the injected backend result does not match pygama's topology"
+            raise BayesianFitBackendError(msg)
+
+        coefficient_count = len(self.pars)
+        normalized = {
+            key: np.asarray(result[key], dtype=float)
+            for key in _CALIBRATION_RESULT_KEYS
+        }
+        result_groups = (
+            ("pk_cal_pars", "pk_cal_errs", "pk_cal_cov"),
+            (
+                "calibration_parameters",
+                "calibration_uncertainties",
+                "calibration_covariance",
+            ),
+        )
+        for parameter_key, uncertainty_key, covariance_key in result_groups:
+            if normalized[parameter_key].shape != (coefficient_count,):
+                msg = f"{parameter_key} has an incompatible shape"
+                raise BayesianFitBackendError(msg)
+            if normalized[uncertainty_key].shape != (coefficient_count,):
+                msg = f"{uncertainty_key} has an incompatible shape"
+                raise BayesianFitBackendError(msg)
+            if normalized[covariance_key].shape != (
+                coefficient_count,
+                coefficient_count,
+            ):
+                msg = f"{covariance_key} has an incompatible shape"
+                raise BayesianFitBackendError(msg)
+        if not all(np.all(np.isfinite(value)) for value in normalized.values()):
+            msg = "the injected backend result contains non-finite values"
+            raise BayesianFitBackendError(msg)
+        # Add provenance only after the compatibility payload is validated, so
+        # artifacts and accepted calibration results remain in step.
+        self.bayesian_calibration_posteriors.append(artifact)
+        return normalized
 
     def gen_pars_dict(self):
         """
@@ -865,9 +1098,13 @@ class HPGeCalibration:
                 uncal_peak_pars.append((peak, loc, range_uncal, n_bins, func))
 
         fit_dict = {}
+        bayesian_peak_posteriors: dict[float, dict[str, np.ndarray]] = {}
+        bayesian_peak_fits: dict[float, object] = {}
         for i_peak, uncal_peak_par in enumerate(uncal_peak_pars):
             peak_kev, mode_guess, wwidth_i, n_bins_i, func_i = uncal_peak_par
             wleft_i, wright_i = wwidth_i
+            peak_posterior_i = None
+            bayesian_fit_i = None
             try:
                 euc_min = mode_guess - wleft_i
                 euc_max = mode_guess + wright_i
@@ -878,7 +1115,27 @@ class HPGeCalibration:
                     )
                 energies = e_uncal[(e_uncal > euc_min) & (e_uncal < euc_max)][:n_events]
                 binw_1 = (euc_max - euc_min) / n_bins_i
-                if method == "unbinned":
+                if self._bayesian_peak_fitter is not None:
+                    (
+                        pars_i,
+                        errs_i,
+                        cov_i,
+                        mu,
+                        mu_err,
+                        peak_posterior_i,
+                        bayesian_fit_i,
+                    ) = self._fit_bayesian_peak(
+                        energies,
+                        func_i,
+                        (euc_min, euc_max),
+                        mode_guess,
+                        peak_param,
+                    )
+                    csqr = (np.nan, np.nan)
+                    p_val = np.nan
+                    valid_pk = True
+
+                elif method == "unbinned":
                     (
                         pars_i,
                         errs_i,
@@ -946,72 +1203,74 @@ class HPGeCalibration:
                     )
                     csqr = (csqr[0], csqr[1] + len(np.where(mask)[0]))
 
-                if np.isnan(pars_i).any():
-                    log.debug(
-                        f"hpge_fit_energy_peaks: fit failed for i_peak={i_peak} at loc {mode_guess:g}, par is nan : {pars_i}"
-                    )
-                    raise RuntimeError
+                if peak_posterior_i is None:
+                    if np.isnan(pars_i).any():
+                        log.debug(
+                            f"hpge_fit_energy_peaks: fit failed for i_peak={i_peak} at loc {mode_guess:g}, par is nan : {pars_i}"
+                        )
+                        raise RuntimeError
 
-                p_val = scipy.stats.chi2.sf(csqr[0], csqr[1])
+                    p_val = scipy.stats.chi2.sf(csqr[0], csqr[1])
 
-                total_events = func_i.get_total_events(pars_i, errors=errs_i)
-                if (
-                    cov_i is None
-                    or cov_i.ndim == 0
-                    or sum(sum(c) for c in cov_i[mask, :][:, mask]) == np.inf
-                    or sum(sum(c) for c in cov_i[mask, :][:, mask]) == 0
-                    or np.isnan(sum(sum(c) for c in cov_i[mask, :][:, mask]))
-                ):
-                    log.debug(
-                        f"hpge_fit_energy_peaks: cov estimation failed for i_peak={i_peak} at loc {mode_guess:g}"
-                    )
-                    valid_pk = False
+                    total_events = func_i.get_total_events(pars_i, errors=errs_i)
+                    if (
+                        cov_i is None
+                        or cov_i.ndim == 0
+                        or sum(sum(c) for c in cov_i[mask, :][:, mask]) == np.inf
+                        or sum(sum(c) for c in cov_i[mask, :][:, mask]) == 0
+                        or np.isnan(sum(sum(c) for c in cov_i[mask, :][:, mask]))
+                    ):
+                        log.debug(
+                            f"hpge_fit_energy_peaks: cov estimation failed for i_peak={i_peak} at loc {mode_guess:g}"
+                        )
+                        valid_pk = False
 
-                elif valid_fit is False:
-                    log.debug(
-                        f"hpge_fit_energy_peaks: peak fitting failed for i_peak={i_peak} at loc {mode_guess:g}"
-                    )
-                    valid_pk = False
+                    elif valid_fit is False:
+                        log.debug(
+                            f"hpge_fit_energy_peaks: peak fitting failed for i_peak={i_peak} at loc {mode_guess:g}"
+                        )
+                        valid_pk = False
 
-                elif (
-                    errs_i is None
-                    or pars_i is None
-                    or np.abs(np.array(errs_i)[mask] / np.array(pars_i)[mask]) < 1e-7
-                ).any() or np.isnan(np.array(errs_i)[mask]).any():
-                    log.debug(
-                        f"hpge_fit_energy_peaks: failed for i_peak={i_peak} at loc {mode_guess:g}, parameter error too low"
-                    )
-                    valid_pk = False
+                    elif (
+                        errs_i is None
+                        or pars_i is None
+                        or np.abs(np.array(errs_i)[mask] / np.array(pars_i)[mask])
+                        < 1e-7
+                    ).any() or np.isnan(np.array(errs_i)[mask]).any():
+                        log.debug(
+                            f"hpge_fit_energy_peaks: failed for i_peak={i_peak} at loc {mode_guess:g}, parameter error too low"
+                        )
+                        valid_pk = False
 
-                elif np.abs(total_events[0] - len(energies)) / len(energies) > 0.1:
-                    log.debug(
-                        f"hpge_fit_energy_peaks: fit failed for i_peak={i_peak} at loc {mode_guess:g}, total_events is outside limit"
-                    )
-                    valid_pk = False
+                    elif np.abs(total_events[0] - len(energies)) / len(energies) > 0.1:
+                        log.debug(
+                            f"hpge_fit_energy_peaks: fit failed for i_peak={i_peak} at loc {mode_guess:g}, total_events is outside limit"
+                        )
+                        valid_pk = False
 
-                elif (p_val < allowed_p_val and (csqr[0] / csqr[1]) > 10) or np.isnan(
-                    p_val
-                ):
-                    log.debug(
-                        f"hpge_fit_energy_peaks: fit failed for i_peak={i_peak}, p-value too low: {p_val}"
-                    )
-                    valid_pk = False
-                else:
-                    valid_pk = True
+                    elif (
+                        p_val < allowed_p_val and (csqr[0] / csqr[1]) > 10
+                    ) or np.isnan(p_val):
+                        log.debug(
+                            f"hpge_fit_energy_peaks: fit failed for i_peak={i_peak}, p-value too low: {p_val}"
+                        )
+                        valid_pk = False
+                    else:
+                        valid_pk = True
 
-                if peak_param == "mu":
-                    mu, mu_err = func_i.get_mu(pars_i, errors=errs_i)
+                    if peak_param == "mu":
+                        mu, mu_err = func_i.get_mu(pars_i, errors=errs_i)
 
-                elif peak_param == "mode":
-                    mu, mu_err = func_i.get_mode(pars_i, cov=cov_i)
-                else:
-                    log.error(
-                        f"hpge_fit_energy_peaks: mode {self.peak_param} not recognized"
-                    )
-                    raise RuntimeError
+                    elif peak_param == "mode":
+                        mu, mu_err = func_i.get_mode(pars_i, cov=cov_i)
+                    else:
+                        log.error(
+                            f"hpge_fit_energy_peaks: mode {self.peak_param} not recognized"
+                        )
+                        raise RuntimeError
 
             except BaseException as e:
-                if e == KeyboardInterrupt:
+                if isinstance(e, (KeyboardInterrupt, NotImplementedError)):
                     raise (e)
                 elif self.debug_mode:
                     raise (e)
@@ -1024,6 +1283,10 @@ class HPGeCalibration:
                 mu = np.nan
                 mu_err = np.nan
                 csqr = (np.nan, np.nan)
+
+            if peak_posterior_i is not None:
+                bayesian_peak_posteriors[peak_kev] = peak_posterior_i
+                bayesian_peak_fits[peak_kev] = bayesian_fit_i
 
             fit_dict[peak_kev] = {
                 "function": func_i,
@@ -1040,6 +1303,9 @@ class HPGeCalibration:
             }
 
         results_dict["peak_parameters"] = fit_dict
+        if self._bayesian_peak_fitter is not None:
+            self.bayesian_peak_posteriors.append(bayesian_peak_posteriors)
+            self.bayesian_peak_fits.append(bayesian_peak_fits)
 
         fitted_peaks_kev = np.array(
             [peak for peak in fit_dict if fit_dict[peak]["validity"]]
@@ -1087,27 +1353,19 @@ class HPGeCalibration:
 
         # Now fit the E scale
         try:
-            pars, errs, cov = hpge_fit_energy_scale(
-                mus, mu_vars, fitted_peaks_kev, deg=self.deg, fixed=self.fixed
+            peak_mode_draws = (
+                [bayesian_peak_posteriors[peak]["mode"] for peak in fitted_peaks_kev]
+                if self._bayesian_peak_fitter is not None
+                else None
             )
-
-            results_dict["pk_cal_pars"] = pars
-            results_dict["pk_cal_errs"] = errs
-            results_dict["pk_cal_cov"] = cov
-
-            # Invert the E scale fit to get a calibration function
-            pars, errs, cov = hpge_fit_energy_cal_func(
+            calibration_result = self._fit_calibration_curve(
                 mus,
                 mu_vars,
                 fitted_peaks_kev,
-                pars,
-                deg=self.deg,
-                fixed=self.fixed,
+                peak_mode_draws=peak_mode_draws,
             )
-            self.pars = np.array(pars)
-            results_dict["calibration_parameters"] = pars
-            results_dict["calibration_uncertainties"] = errs
-            results_dict["calibration_covariance"] = cov
+            results_dict.update(calibration_result)
+            self.pars = np.array(calibration_result["calibration_parameters"])
 
         except ValueError:
             log.error("Failed to fit enough peaks to get accurate calibration")
